@@ -1,11 +1,12 @@
 {
-  "policy_name": "Cloud Operations Security Policy",
-  "version": "1.0",
-  "description": "Context-aware policy that restricts agent actions based on operational mode",
+  "policy_name": "Service-Specific Cloud Operations Policy",
+  "version": "2.0",
+  "description": "Granular policy that restricts agent actions to only the affected service",
   "modes": {
     "NORMAL": {
-      "description": "Standard operations mode with read-only access",
+      "description": "Standard operations - read-only monitoring",
       "allowed_tools": [
+        "list_services",
         "get_service_status",
         "read_logs"
       ],
@@ -14,11 +15,12 @@
         "scale_fleet",
         "delete_database"
       ],
-      "rationale": "During normal operations, agents should only monitor systems to prevent accidental changes"
+      "rationale": "Monitor only - no system changes allowed"
     },
     "EMERGENCY": {
-      "description": "Emergency mode allowing corrective actions but blocking destructive operations",
+      "description": "Emergency mode - fix ONLY the broken service",
       "allowed_tools": [
+        "list_services",
         "get_service_status",
         "read_logs",
         "restart_service",
@@ -27,13 +29,20 @@
       "blocked_tools": [
         "delete_database"
       ],
-      "rationale": "In emergencies, agents can take corrective actions but are strictly prevented from destructive operations that could cause data loss"
+      "service_restrictions": {
+        "enabled": true,
+        "rule": "Can only modify services that are currently unhealthy"
+      },
+      "rationale": "Fix only what's broken - healthy services remain untouched"
     }
   },
   "global_rules": {
     "always_blocked": [
       "delete_database"
     ],
-    "description": "Tools that are never allowed regardless of mode"
+    "service_targeting": {
+      "description": "Actions must target only unhealthy services",
+      "enforcement": "Agent must check service health before any modification"
+    }
   }
 }

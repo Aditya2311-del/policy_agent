@@ -1,13 +1,13 @@
 """
-Policy Engine for Proxi: Context-Aware Cloud Guardian
+Policy Engine for Proxi: Service-Specific Cloud Guardian
 
-This module implements the core security enforcement mechanism that validates
-all agent actions against defined operational policies.
+Enforces granular policies - agents can only fix broken services, not healthy ones.
 """
 
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 from pathlib import Path
+from datetime import datetime
 
 
 class PolicyViolationError(Exception):
@@ -22,137 +22,160 @@ class PolicyViolationError(Exception):
 
 class PolicyEngine:
     """
-    Enforces context-aware security policies on agent actions.
+    Enforces service-specific security policies.
     
-    The Policy Engine loads operational policies from a JSON file and validates
-    every tool execution request against the current operational mode.
+    Key Feature: In EMERGENCY mode, agents can only modify services that are unhealthy.
+    Healthy services are protected from unnecessary changes.
     """
     
     def __init__(self, policy_path: str):
-        """
-        Initialize the Policy Engine with a policy file.
-        
-        Args:
-            policy_path: Path to the JSON policy configuration file
-        """
         self.policy_path = Path(policy_path)
         self.policy = self._load_policy()
-        self.current_mode = "NORMAL"  # Default to most restrictive mode
+        self.current_mode = "NORMAL"
+        self.unhealthy_services: Set[str] = set()  # Track which services are broken
         
     def _load_policy(self) -> Dict[str, Any]:
-        """Load and parse the policy JSON file."""
+        """Load policy configuration."""
         if not self.policy_path.exists():
             raise FileNotFoundError(f"Policy file not found: {self.policy_path}")
         
         with open(self.policy_path, 'r') as f:
             policy = json.load(f)
         
-        print(f"✓ Loaded policy: {policy.get('policy_name', 'Unknown')}")
-        print(f"  Version: {policy.get('version', 'Unknown')}")
+        print(f"✓ Loaded policy: {policy.get('policy_name', 'Unknown')} v{policy.get('version', '?')}")
         return policy
     
     def set_mode(self, mode: str) -> None:
-        """
-        Change the operational mode.
-        
-        Args:
-            mode: One of "NORMAL" or "EMERGENCY"
-        
-        Raises:
-            ValueError: If the mode is not defined in the policy
-        """
+        """Change operational mode."""
         if mode not in self.policy['modes']:
-            raise ValueError(f"Invalid mode: {mode}. Available: {list(self.policy['modes'].keys())}")
+            raise ValueError(f"Invalid mode: {mode}")
         
         self.current_mode = mode
-        print(f"\n🔄 Policy mode changed to: {mode}")
+        print(f"\n🔄 Mode: {mode}")
         print(f"   {self.policy['modes'][mode]['description']}")
     
+    def register_unhealthy_service(self, service_name: str) -> None:
+        """
+        Mark a service as unhealthy.
+        Only unhealthy services can be modified in EMERGENCY mode.
+        """
+        self.unhealthy_services.add(service_name)
+        print(f"⚠️  Registered unhealthy service: {service_name}")
+    
+    def mark_service_healthy(self, service_name: str) -> None:
+        """Remove a service from the unhealthy list after it's fixed."""
+        self.unhealthy_services.discard(service_name)
+        print(f"✓ Service marked healthy: {service_name}")
+    
+    def validate(self, tool_name: str, args: Dict[str, Any] = None, context: Dict[str, Any] = None) -> bool:
+        """
+        Validate if a tool execution is allowed.
+        
+        Key Logic:
+        - Read operations: Always allowed
+        - Write operations in NORMAL mode: Blocked
+        - Write operations in EMERGENCY mode: Only allowed on unhealthy services
+        """
+        args = args or {}
+        context = context or {}
+        
+        # Always blocked tools (destructive operations)
+        if tool_name in self.policy['global_rules']['always_blocked']:
+            raise PolicyViolationError(
+                f"'{tool_name}' is permanently blocked - destructive operation",
+                tool_name=tool_name,
+                mode=self.current_mode,
+                reason="Globally blocked"
+            )
+        
+        mode_policy = self.policy['modes'][self.current_mode]
+        
+        # Check if tool is blocked in current mode
+        if tool_name in mode_policy['blocked_tools']:
+            raise PolicyViolationError(
+                f"'{tool_name}' blocked in {self.current_mode} mode",
+                tool_name=tool_name,
+                mode=self.current_mode,
+                reason=mode_policy['rationale']
+            )
+        
+        # Check if tool is allowed
+        if tool_name not in mode_policy['allowed_tools']:
+            raise PolicyViolationError(
+                f"'{tool_name}' not whitelisted for {self.current_mode} mode",
+                tool_name=tool_name,
+                mode=self.current_mode,
+                reason="Not in allowed tools list"
+            )
+        
+        # SERVICE-SPECIFIC CHECK (the key feature!)
+        # For modification tools, verify they target only unhealthy services
+        if self._is_modification_tool(tool_name):
+            service_name = args.get('service_name')
+            
+            if not service_name:
+                raise PolicyViolationError(
+                    f"'{tool_name}' requires a service_name parameter",
+                    tool_name=tool_name,
+                    mode=self.current_mode,
+                    reason="Missing service target"
+                )
+            
+            # In EMERGENCY mode, check if service is actually unhealthy
+            if self.current_mode == "EMERGENCY":
+                restrictions = mode_policy.get('service_restrictions', {})
+                if restrictions.get('enabled', False):
+                    if service_name not in self.unhealthy_services:
+                        raise PolicyViolationError(
+                            f"Cannot modify '{service_name}' - service is healthy. "
+                            f"Only broken services can be modified: {list(self.unhealthy_services)}",
+                            tool_name=tool_name,
+                            mode=self.current_mode,
+                            reason="Target service is not unhealthy"
+                        )
+        
+        print(f"  ✓ Policy OK: {tool_name} allowed for {args.get('service_name', 'all services')}")
+        return True
+    
+    def _is_modification_tool(self, tool_name: str) -> bool:
+        """Check if a tool modifies system state (vs just reading)."""
+        modification_tools = ['restart_service', 'scale_fleet', 'delete_database']
+        return tool_name in modification_tools
+    
     def get_current_mode(self) -> str:
-        """Get the current operational mode."""
         return self.current_mode
     
     def get_allowed_tools(self) -> List[str]:
-        """Get the list of tools allowed in the current mode."""
         return self.policy['modes'][self.current_mode]['allowed_tools']
     
     def get_blocked_tools(self) -> List[str]:
         """Get the list of tools blocked in the current mode."""
         return self.policy['modes'][self.current_mode]['blocked_tools']
     
-    def validate(self, tool_name: str, args: Dict[str, Any] = None, context: Dict[str, Any] = None) -> bool:
-        """
-        Validate whether a tool execution is allowed under the current policy.
-        
-        Args:
-            tool_name: Name of the tool to execute
-            args: Arguments passed to the tool (for future use in advanced policies)
-            context: Additional context about the request
-        
-        Returns:
-            True if the action is allowed
-        
-        Raises:
-            PolicyViolationError: If the action violates the current policy
-        """
-        args = args or {}
-        context = context or {}
-        
-        # Check global rules first (always blocked tools)
-        if tool_name in self.policy['global_rules']['always_blocked']:
-            raise PolicyViolationError(
-                f"Tool '{tool_name}' is globally blocked and can never be executed",
-                tool_name=tool_name,
-                mode=self.current_mode,
-                reason="Globally blocked - destructive operation"
-            )
-        
-        # Get the current mode's policy
-        mode_policy = self.policy['modes'][self.current_mode]
-        allowed_tools = mode_policy['allowed_tools']
-        blocked_tools = mode_policy['blocked_tools']
-        
-        # Check if tool is explicitly blocked in current mode
-        if tool_name in blocked_tools:
-            raise PolicyViolationError(
-                f"Tool '{tool_name}' is blocked in {self.current_mode} mode. "
-                f"Rationale: {mode_policy['rationale']}",
-                tool_name=tool_name,
-                mode=self.current_mode,
-                reason=f"Blocked in {self.current_mode} mode"
-            )
-        
-        # Check if tool is in allowed list
-        if tool_name not in allowed_tools:
-            raise PolicyViolationError(
-                f"Tool '{tool_name}' is not in the allowed list for {self.current_mode} mode",
-                tool_name=tool_name,
-                mode=self.current_mode,
-                reason=f"Not whitelisted for {self.current_mode} mode"
-            )
-        
-        # Validation passed
-        print(f"  ✓ Policy check passed: {tool_name} allowed in {self.current_mode} mode")
-        return True
-    
     def get_policy_summary(self) -> str:
-        """Generate a human-readable summary of the current policy state."""
+        """Show current policy state."""
         mode_info = self.policy['modes'][self.current_mode]
         
         summary = f"""
-╔════════════════════════════════════════════════════════════════╗
-║  POLICY ENGINE STATUS                                          ║
-╠════════════════════════════════════════════════════════════════╣
-║  Current Mode: {self.current_mode:<47} ║
-║  Description:  {mode_info['description']:<47} ║
-╠════════════════════════════════════════════════════════════════╣
-║  Allowed Tools:                                                ║
-{self._format_tool_list(mode_info['allowed_tools'])}
-╠════════════════════════════════════════════════════════════════╣
-║  Blocked Tools:                                                ║
-{self._format_tool_list(mode_info['blocked_tools'])}
-╚════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║  POLICY STATUS                                            ║
+╠═══════════════════════════════════════════════════════════╣
+║  Mode: {self.current_mode:<50} ║
+║  {mode_info['description']:<58}║
+╠═══════════════════════════════════════════════════════════╣
+║  Unhealthy Services (can modify):                         ║
 """
+        if self.unhealthy_services:
+            for svc in self.unhealthy_services:
+                summary += f"║    🔴 {svc:<52} ║\n"
+        else:
+            summary += f"║    (none - all services healthy)                      ║\n"
+        
+        summary += "╠═══════════════════════════════════════════════════════════╣\n"
+        summary += f"║  Allowed: {', '.join(mode_info['allowed_tools'][:2]):<46}║\n"
+        summary += f"║  Blocked: {', '.join(mode_info['blocked_tools'][:2]):<46}║\n"
+        summary += "╚═══════════════════════════════════════════════════════════╝"
+        
         return summary
     
     def _format_tool_list(self, tools: List[str]) -> str:

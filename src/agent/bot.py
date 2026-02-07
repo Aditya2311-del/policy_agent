@@ -48,7 +48,6 @@ class ProxiAgent:
     def _create_llm(self):
         """Create the LLM (with mock fallback for demo without API keys)."""
         if self.use_mock:
-            # Use a mock LLM for demo purposes
             return MockLLM()
         else:
             # Try to use real LLM if API key is available
@@ -56,7 +55,7 @@ class ProxiAgent:
                 from langchain_google_genai import ChatGoogleGenerativeAI
                 if os.getenv("GOOGLE_API_KEY"):
                     return ChatGoogleGenerativeAI(
-                        model="gemini-2.5-flash",
+                        model="gemini-2.5-flash-lite",
                         temperature=0
                     )
             except:
@@ -136,7 +135,8 @@ class ProxiAgent:
                     "restart_service", 
                     service_name=service_name
                 ),
-                description="Restart a cloud service. WARNING: Only available in EMERGENCY mode. "
+                description="Restart a cloud service. WARNING: Only works in EMERGENCY mode "
+                           "and ONLY for services that are unhealthy. "
                            "Requires service_name parameter."
             ),
             Tool(
@@ -159,17 +159,24 @@ class ProxiAgent:
 Your mission is to maintain system health and resolve incidents while strictly adhering to security policies.
 
 CRITICAL POLICY AWARENESS:
-- You operate under a Policy Engine that enforces context-aware security constraints
-- In NORMAL mode: You can only READ data (get_service_status, read_logs)
-- In EMERGENCY mode: You can take corrective actions (restart_service, scale_fleet) BUT still cannot perform destructive operations
+- You operate under a SERVICE-SPECIFIC Policy Engine that enforces granular security constraints
+- In NORMAL mode: You can only READ data (get_service_status, read_logs, list_services)
+- In EMERGENCY mode: You can fix ONLY services that are unhealthy - healthy services are protected
 - Destructive operations like delete_database are ALWAYS BLOCKED regardless of mode
 
+SERVICE-SPECIFIC ENFORCEMENT:
+- You CANNOT restart or modify healthy services, even in EMERGENCY mode
+- Always check service health FIRST using get_service_status
+- Only attempt fixes on services that are confirmed unhealthy
+- Policy tracks which services are broken - you can only touch those
+
 BEHAVIORAL GUIDELINES:
-1. When a tool is blocked by policy, DO NOT retry it - the policy is absolute
-2. If blocked, acknowledge the policy constraint and explain WHY it's blocked
-3. Suggest alternative safer approaches when your preferred action is blocked
-4. Always check service status before attempting corrective actions
-5. Be transparent about what you can and cannot do in the current mode
+1. ALWAYS check service status before attempting any corrective action
+2. When blocked, acknowledge the policy constraint and explain WHY it's blocked
+3. If a healthy service is blocked: explain it's working fine and doesn't need fixing
+4. If wrong mode: explain what mode is needed
+5. Suggest safe alternatives when your preferred action is blocked
+6. Be transparent about what you can and cannot do
 
 RESPONSE STYLE:
 - Be concise and professional
@@ -177,7 +184,7 @@ RESPONSE STYLE:
 - Propose alternative solutions when primary action is unavailable
 - Show your reasoning process step by step
 
-Remember: Safety and policy compliance come before speed of resolution."""
+Remember: You can only fix what's broken. Healthy services are off-limits."""
 
         if self.use_mock:
             # For mock demo, we'll use a simplified executor
@@ -297,24 +304,58 @@ class MockAgentExecutor:
         print(f"   Task analysis: {task}")
         
         # Determine which tools to try based on task
-        if "restart" in task_lower:
-            print("   → Thought: The task requires restarting a service")
-            print("   → Action: Attempting to use restart_service tool")
+        if "restart" in task_lower and "web" in task_lower:
+            print("   → Thought: Task requires restarting web-server")
+            print("   → Action: First checking if web-server is unhealthy")
             
+            status_result = self.tools["get_service_status"].func("web-server")
+            print(f"   → Observation: {status_result}")
+            
+            print("   → Action: Attempting to restart web-server")
             result = self.tools["restart_service"].func("web-server")
             print(f"   → Observation: {result}")
             
             if "POLICY BLOCKED" in result:
+                if "healthy" in result.lower() or "not unhealthy" in result.lower():
+                    output = (
+                        f"I checked the web-server status and attempted to restart it, but was blocked:\n\n"
+                        f"{result}\n\n"
+                        f"The web-server is currently HEALTHY, so the policy prevents me from modifying it. "
+                        f"This is a safety feature - I can only fix services that are actually broken.\n\n"
+                        f"Since the service is working fine, no action is needed!"
+                    )
+                else:
+                    output = (
+                        f"I attempted to restart the web-server, but the operation was blocked:\n\n"
+                        f"{result}\n\n"
+                        f"We're likely in NORMAL mode, which only allows monitoring. "
+                        f"To restart services, the system needs to be in EMERGENCY mode."
+                    )
+            else:
+                output = f"✓ Successfully restarted the web-server (it was unhealthy). {result}"
+        
+        elif "restart" in task_lower and "database" in task_lower:
+            print("   → Thought: Task requires restarting database")
+            print("   → Action: First checking database status")
+            
+            status_result = self.tools["get_service_status"].func("database")
+            print(f"   → Observation: {status_result}")
+            
+            print("   → Action: Attempting to restart database")
+            result = self.tools["restart_service"].func("database")
+            print(f"   → Observation: {result}")
+            
+            if "POLICY BLOCKED" in result:
                 output = (
-                    f"I attempted to restart the web-server, but the operation was blocked by policy.\n\n"
+                    f"I attempted to restart the database, but was blocked by policy:\n\n"
                     f"{result}\n\n"
-                    f"This is because we are in a restricted operational mode that only allows read-only operations. "
-                    f"In NORMAL mode, I can only monitor systems using get_service_status and read_logs. "
-                    f"To restart services, the system would need to be in EMERGENCY mode.\n\n"
-                    f"Would you like me to check the current service status instead?"
+                    f"The database service is HEALTHY and working fine. The policy only allows me "
+                    f"to modify services that are actually broken. This prevents unnecessary changes "
+                    f"to stable systems.\n\n"
+                    f"Good news: Your database doesn't need fixing!"
                 )
             else:
-                output = f"Successfully restarted the web-server. {result}"
+                output = f"✓ Successfully restarted the database. {result}"
         
         elif "delete" in task_lower and "database" in task_lower:
             print("   → Thought: The task involves deleting a database")
@@ -326,54 +367,51 @@ class MockAgentExecutor:
             output = (
                 f"I attempted to delete the database, but this operation is strictly forbidden.\n\n"
                 f"{result}\n\n"
-                f"Database deletion is a destructive operation that is ALWAYS BLOCKED by policy, "
-                f"regardless of operational mode. This is a critical safety measure to prevent data loss.\n\n"
-                f"Instead, I recommend:\n"
-                f"1. Check database size and usage with read_logs\n"
-                f"2. Archive old data rather than deleting\n"
-                f"3. Scale up storage capacity if needed\n"
-                f"4. Contact a database administrator for manual intervention if absolutely necessary"
+                f"Database deletion is ALWAYS BLOCKED by policy, regardless of mode or service health. "
+                f"This is a critical safety measure to prevent data loss.\n\n"
+                f"Alternative approaches:\n"
+                f"1. Archive old data instead of deleting\n"
+                f"2. Scale up storage capacity\n"
+                f"3. Contact a DBA for manual intervention if absolutely necessary"
             )
         
         elif "fix" in task_lower or "critical" in task_lower:
-            print("   → Thought: This is a critical issue requiring corrective action")
+            print("   → Thought: Critical issue requiring corrective action")
             print("   → Action: First checking service status")
             
-            status_result = self.tools["get_service_status"].func("web-server")
+            status_result = self.tools["get_service_status"].func()
             print(f"   → Observation: {status_result}")
             
-            print("   → Thought: Now attempting to restart the service")
+            print("   → Thought: Attempting to restart the unhealthy service")
             restart_result = self.tools["restart_service"].func("web-server")
             print(f"   → Observation: {restart_result}")
             
             if "Success" in restart_result:
                 output = (
-                    f"I successfully resolved the critical issue:\n\n"
-                    f"1. Checked service status: {status_result}\n"
-                    f"2. Restarted the web-server: {restart_result}\n\n"
-                    f"The service should now be operational. The system is in EMERGENCY mode, "
-                    f"which allowed me to perform corrective actions."
+                    f"✓ Critical issue resolved:\n\n"
+                    f"1. Diagnosed: {status_result}\n"
+                    f"2. Fixed: {restart_result}\n\n"
+                    f"The web-server was unhealthy, so I was allowed to restart it in EMERGENCY mode."
                 )
             else:
                 output = (
-                    f"I attempted to fix the critical issue but was blocked by policy:\n\n"
+                    f"I attempted to fix the critical issue but was blocked:\n\n"
                     f"{restart_result}\n\n"
-                    f"The current operational mode prevents me from restarting services. "
-                    f"I can monitor the situation and provide diagnostics, but corrective actions "
-                    f"require EMERGENCY mode to be enabled."
+                    f"Either we're in NORMAL mode (need EMERGENCY mode), or the service "
+                    f"is actually healthy and doesn't need fixing."
                 )
         
         else:
-            print("   → Thought: Gathering information about system status")
+            print("   → Thought: Gathering system status information")
             print("   → Action: Checking service status")
             
             result = self.tools["get_service_status"].func()
             print(f"   → Observation: {result}")
             
             output = (
-                f"I've checked the current infrastructure status:\n\n"
+                f"Current infrastructure status:\n\n"
                 f"{result}\n\n"
-                f"All services appear to be operational. Is there a specific issue you'd like me to investigate?"
+                f"All services operational. Need help with a specific issue?"
             )
         
         print(f"\n💬 Agent response:\n{output}\n")
